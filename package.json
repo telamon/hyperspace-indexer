@@ -1,0 +1,22 @@
+{
+  "name": "hyper-indexer",
+  "version": "0.1.0",
+  "description": "Index hyper:// links",
+  "main": "index.js",
+  "scripts": {
+    "lint": "standard",
+    "test": "tape test.js",
+    "debug": "node inspect $(npm bin)/tape test.js",
+    "prepublishOnly": "standard && npm test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git://https://github.com/telamon/hyper-indexer"
+  },
+  "author": "Tony Ivanov",
+  "license": "AGPL-3.0-or-later",
+  "bugs": {
+    "url": "https://github.com/telamon/hyper-indexer"
+  },
+  "homepage": "https://github.com/telamon/hyper-indexer"
+}
