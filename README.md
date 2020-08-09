@@ -4,7 +4,7 @@
 
 > Index hyper:// links
 
-Builds an hyperdrive powered redistributable phonebook that can queried offline.
+Builds an hyperdrive powered redistributable phonebook that can be queried offline.
 
 Database layout
 ```
