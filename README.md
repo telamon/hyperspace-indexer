@@ -4,16 +4,29 @@
 
 > Index hyper:// links
 
+Builds an hyperdrive powered redistributable phonebook that can queried offline.
+
+Database layout
+```
+about/{drive.key} # => { title: '...', description: '...', version: 3, seeds: 500 }
+backlinks/{linkTarget.key}/{drive.key} # => /path/file:lineNumber
+updates/{utc}_{drive.key}_{path?file} # => {drive.version}
+ngrams/h/e/l/l/o/{drive.key} #=> /path/file:lineNumber
+filelists/{drive.key} # => line-separated list of files. (mounts excluded)
+```
+
 ## Use
 
+Step 1. Clone this repository
+
+Step 2. Run:
+
 ```bash
-$ npm install hyper-indexer
+$ node index.js
 ```
 
-```js
-const mod = require('hyper-indexer')
-mod.doMagic() // => Result
-```
+A drive `dist/` should be generated containing all analyzed indexes,
+Also the file `database.url` should be generated containing the `hyper://...` URL to the database.
 
 ## Donations
 
@@ -62,4 +75,4 @@ Only changesets by human contributors will be accepted.
 
 [AGPL-3.0-or-later](./LICENSE)
 
-2020 &#x1f12f; Tony Ivanov
+2020 &#x1f12f; Decent Labs AB - Tony Ivanov
