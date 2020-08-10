@@ -16,7 +16,7 @@ const PARALLELIZATION = 5
 const MDLINK_EXP = /\[([^\]]+)\]\(([^\)]+)\)/ // eslint-disable-line no-useless-escape
 
 const hyperdrive = require('hyperdrive')
-const log = console.log.bind(null, '[Indexer]')
+const log = (...args) => console.log(new Date().toJSON(), '[Indexer]', ...args)
 
 async function scrape () {
   const res = await defer(done => https.get('https://userlist.beakerbrowser.com/', done.bind(null, null)))
@@ -102,6 +102,18 @@ class Indexer {
     return drive
   }
 
+  async _releaseDrive (drive) {
+    const key = drive.key
+    try {
+      // await defer(d => drive.destroyStorage(d))
+      await defer(d => drive.close(d))
+    } catch (err) {
+      log('Failed closing drive', err)
+    } finally {
+      delete this._drives[key.toString('hex')]
+    }
+  }
+
   _process (url, done) {
     this.__process(url)
       .then(done.bind(null, null))
@@ -185,7 +197,7 @@ class Indexer {
     } finally {
       // Free resources
       await defer(done => swarm.leave(topic, done))
-      await defer(d => drive.destroyStorage(d))
+      await this._releaseDrive(drive)
       for (const socket of sockets) socket.end()
     }
 
@@ -206,11 +218,12 @@ class Indexer {
     // Give people a chance to opt-out of indexing
     if (list.find(file => file.match(/\.nocrawl$/))) return null
 
-    const aggr = { size: 0, files: 0 }
+    const aggr = { size: 0, files: 0, updatedAt: -1 }
     const tasks = []
     tasks.push(this._writeEntry(`filelists/${drive.key.hexSlice()}`, list.join('\n')))
 
     for (const file of list) {
+      log('Processing file', file)
       if (file.match(/\.(md|txt)$/i)) tasks.push(this._analyzeText(drive, file))
       if (file.match(/^index.json$/i)) tasks.push(this._indexJson(aggr, drive, file))
       // TODO: analyze html + find links
@@ -232,7 +245,7 @@ class Indexer {
     const text = body.toString('utf8')
     let nLinks = 0
     for (const link of text.matchAll(new RegExp(MDLINK_EXP, 'g'))) {
-      if (link[2].match(/^.?\//)) link[2] = `hyper://${drive.key.hexSlice()}/${link[2]}`
+      if (link[2].match(/^\.?\.?\//)) link[2] = `hyper://${drive.key.hexSlice()}/${link[2]}`
       let url = null
       try {
         url = new URL(link[2])
@@ -270,7 +283,7 @@ class Indexer {
     const fstat = await defer(d => drive.lstat(file, { wait: true }, d))
     aggr.files++
     aggr.size += fstat.size
-    if (aggr.updatedAt < fstat.mtime.getTime()) aggr.updateAt = fstat.mtime.getTime()
+    if (aggr.updatedAt < fstat.mtime.getTime()) aggr.updatedAt = fstat.mtime.getTime()
     const key = `updates/${fstat.mtime.getTime()}_${drive.key.hexSlice()}_${file.replace(/\//g, '+')}`
     await this._writeEntry(key, `${drive.version}`)
   }
@@ -338,19 +351,35 @@ if (require.main === module) {
     idxr.replicate()
     writeFileSync('database.url', `hyper://${idxr._dist.key.hexSlice()}`)
   })
+
   if (!process.argv[2]) {
-    scrape()
-      .then(drives => {
-        // writeFileSync('drives.json', JSON.stringify(drives))
-        // await idxr.ready()
-        for (const drive of drives) {
-          idxr.index(drive.url)
-        }
-      })
-      .catch(err => {
-        console.error('Indexing failed', err)
-      })
-  } else {
+    let drives = []
+    const fetchUserDirectory = () => {
+      scrape()
+        .then(d => {
+          drives = d
+          // writeFileSync('drives.json', JSON.stringify(drives))
+          // await idxr.ready()
+          for (const drive of drives) {
+            idxr.index(drive.url)
+          }
+        })
+        .catch(err => {
+          console.error('Indexing failed', err)
+        })
+
+      setTimeout(fetchUserDirectory, 6 * 60 * 60 * 1000)
+    }
+    fetchUserDirectory()
+
+    const crawl = () => {
+      for (const drive of drives) {
+        idxr.index(drive.url)
+      }
+      setTimeout(crawl, 30 * 60 * 1000)
+    }
+    setTimeout(crawl, 60 * 1000)
+  } else if (process.argv[2] !== 'seed') {
     idxr.index(process.argv[2])
   }
 }
