@@ -9,9 +9,11 @@ const sbd = require('sbd').sentences
 const eos = require('end-of-stream')
 
 const MINGLE_TIMEOUT = 1000 * 5
+const DOWNLOAD_TIMEOUT = 1000 * 60
 const IDLE_TIMEOUT = 1000 * 60
-const REINDEX_THRESHOLD = 10 * 60 * 1000
-const PARALLELIZATION = 5
+const REINDEX_THRESHOLD = 1000 * 60 * 60 * 1 // 1hour
+const PARALLELIZATION = 3
+const PARALLEL_FILES = 5
 
 const MDLINK_EXP = /\[([^\]]+)\]\(([^\)]+)\)/ // eslint-disable-line no-useless-escape
 
@@ -63,7 +65,14 @@ class Indexer {
     this._dist = hyperdrive('./dist')
     // this.client = new HyperspaceClient()
     this._lastIndexed = {}
-    this._dist.on('ready', () => console.log(`Database url: hyper://${this._dist.key.hexSlice()}`))
+    this._dist.on('ready', async () => {
+      console.log(`Database url: hyper://${this._dist.key.hexSlice()}`)
+      await this._writeEntry('.nocrawl', 'nocrawl')
+      await this._writeEntry('index.json', JSON.stringify({
+        title: 'hyperdex database',
+        description: 'Contains pre-indexed records ready to be looked up'
+      }))
+    })
   }
 
   replicate () {
@@ -209,8 +218,11 @@ class Indexer {
   async _crawlDrive (drive) {
     log('fetching file-list')
     const list = await defer(done => {
-      drive.readdir('/', { recursive: true, noMount: true }, done)
-      setTimeout(() => done(new Error('READDIR_TIMEOUT')), IDLE_TIMEOUT)
+      const timer = setTimeout(() => done(new Error('READDIR_TIMEOUT')), IDLE_TIMEOUT)
+      drive.readdir('/', { recursive: true, noMounts: true }, (err, l) => {
+        clearTimeout(timer)
+        done(err, l)
+      })
     })
     log('Filelist received:', list)
     if (!list || !list.length) return null
@@ -219,18 +231,33 @@ class Indexer {
     if (list.find(file => file.match(/\.nocrawl$/))) return null
 
     const aggr = { size: 0, files: 0, updatedAt: -1 }
-    const tasks = []
-    tasks.push(this._writeEntry(`filelists/${drive.key.hexSlice()}`, list.join('\n')))
-
-    for (const file of list) {
-      log('Processing file', file)
-      if (file.match(/\.(md|txt)$/i)) tasks.push(this._analyzeText(drive, file))
-      if (file.match(/^index.json$/i)) tasks.push(this._indexJson(aggr, drive, file))
-      // TODO: analyze html + find links
-      tasks.push(this._appendUpdates(aggr, drive, file))
-    }
-
-    await Promise.all(tasks)
+    await defer(indexingDone => {
+      const que = new NanoQueue(PARALLEL_FILES, {
+        process (task, done) {
+          task()
+            .then(() => {
+              log('Indexing task succeeded')
+              done()
+            })
+            .catch(err => {
+              log('Indexing task failed', err)
+              done()
+            })
+        },
+        oncomplete () {
+          log('All drive tasks complete')
+          indexingDone()
+        }
+      })
+      que.push(() => this._writeEntry(`filelists/${drive.key.hexSlice()}`, list.join('\n')))
+      for (const file of list) {
+        log('Processing file', file)
+        if (file.match(/\.(md|txt)$/i)) que.push(() => this._analyzeText(drive, file))
+        if (file.match(/^index.json$/i)) que.push(() => this._indexJson(aggr, drive, file))
+        // TODO: analyze html + find links
+        que.push(() => this._appendUpdates(aggr, drive, file))
+      }
+    })
     return aggr
   }
 
@@ -303,9 +330,12 @@ async function readRemoteFile (drive, file) {
   const fstat = await defer(d => drive.lstat(file, { wait: true }, d))
   if (!fstat.size) return { fstat, body: null }
   const body = await defer(d => {
-    // log('Downloading', file)
+    log('downloading...', file)
+    const timer = setTimeout(() => d(new Error('DOWNLOAD_TIMEOUT')), DOWNLOAD_TIMEOUT)
+
     drive.download(file, err => {
-      // log('Complete', file)
+      clearTimeout(timer)
+      log('download complete', file)
       if (err) return d(err)
       drive.readFile(file, (err, chunk) => {
         if (err) return d(err)
@@ -380,6 +410,6 @@ if (require.main === module) {
     }
     setTimeout(crawl, 60 * 1000)
   } else if (process.argv[2] !== 'seed') {
-    idxr.index(process.argv[2])
+    idxr.index(process.argv[2], true)
   }
 }
