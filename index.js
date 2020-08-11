@@ -12,7 +12,7 @@ const MINGLE_TIMEOUT = 1000 * 5
 const DOWNLOAD_TIMEOUT = 1000 * 60
 const IDLE_TIMEOUT = 1000 * 60
 const REINDEX_THRESHOLD = 1000 * 60 * 60 * 1 // 1hour
-const PARALLELIZATION = 3
+const PARALLELIZATION = 6
 const PARALLEL_FILES = 5
 
 const MDLINK_EXP = /\[([^\]]+)\]\(([^\)]+)\)/ // eslint-disable-line no-useless-escape
@@ -51,8 +51,16 @@ async function scrape () {
 
 function resolveKey (url) {
   // dat-dns? What's used in beaker to resolve hyper://?
-  const key = new URL(url).host
-  return key && Buffer.from(key, 'hex')
+  if (Buffer.isBuffer(url)) {
+    if (url.length === 32) return url
+    throw new Error(`Unknown buffer received as URL: ${url.hexSlice()}`)
+  }
+  const isHexkey = str => typeof str === 'string' && str.length === 64 && str.match(/^[a-f0-9]+$/)
+  if (isHexkey(url)) return Buffer.from(url, 'hex')
+
+  const u = new URL(url)
+  if (isHexkey(u.host)) return Buffer.from(u.host, 'hex')
+  throw new Error('dns lookups not yet implemented', url)
 }
 
 class Indexer {
@@ -82,6 +90,7 @@ class Indexer {
       // maxServerSockets: 0
     })
     swarm.on('connection', (socket, info) => {
+      log('Connection on distribution topic', socket.remoteAddress)
       const dstream = this._dist.replicate(info.client, { encrypt: true })
       dstream.on('error', err => {
         console.warn('Distribution to peer failed', err)
@@ -124,15 +133,15 @@ class Indexer {
   }
 
   _process (url, done) {
-    this.__process(url)
+    this._joinSwarm(url)
       .then(done.bind(null, null))
       .catch(err => {
         console.error('Failed processing', err)
-        done(err)
+        done()
       })
   }
 
-  async __process (url) {
+  async _joinSwarm (url) {
     const key = resolveKey(url)
     if (!key) throw new Error('KeyResolutionFailure')
     // TODO: index only if hasn't been indexed within 2hours, use the `about/{drive.key}` index for lookup.
@@ -199,7 +208,15 @@ class Indexer {
       if (about) {
         about.peers = Object.keys(uniquePeers).length
         about.version = drive.version
-        await this._writeEntry(`about/${drive.key.hexSlice()}`, JSON.stringify(about), true)
+        const akey = `about/${drive.key.hexSlice()}`
+        let forceWrite = true
+        try {
+          const prev = await defer(d => this._dist.readFile(`about/${drive.key.hexSlice()}`, d))
+          forceWrite = about.version > JSON.parse(prev.toString()).version
+        } catch (err) {
+          log('No previous entry?', akey, err)
+        }
+        await this._writeEntry(`about/${drive.key.hexSlice()}`, JSON.stringify(about), forceWrite)
       }
     } catch (err) {
       if (err.message !== 'IDLE_TIMEOUT' || err.message !== 'READDIR_TIMEOUT') throw err
@@ -322,6 +339,7 @@ class Indexer {
     }
     if (!Buffer.isBuffer(value)) value = Buffer.from(value)
     await defer(d => this._dist.writeFile(key, value, d))
+    log('Entry written', key)
     return true
   }
 }
@@ -388,6 +406,7 @@ if (require.main === module) {
       scrape()
         .then(d => {
           drives = d
+          drives.sort((a, b) => Math.random() - 0.5)
           // writeFileSync('drives.json', JSON.stringify(drives))
           // await idxr.ready()
           for (const drive of drives) {
@@ -403,6 +422,7 @@ if (require.main === module) {
     fetchUserDirectory()
 
     const crawl = () => {
+      drives.sort((a, b) => Math.random() - 0.5)
       for (const drive of drives) {
         idxr.index(drive.url)
       }

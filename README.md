@@ -10,7 +10,7 @@ Database layout
 ```
 about/{drive.key} # => { title: '...', description: '...', version: 3, seeds: 500 }
 backlinks/{linkTarget.key}/{drive.key} # => /path/file:lineNumber
-updates/{utc}_{drive.key}_{path+file} # => {version: '', title: '', ellipsis: ''}
+updates/{date}/{utc}_{drive.key}_{path+file} # => {version: '', title: '', ellipsis: ''}
 ngrams/h/e/l/l/o/{drive.key} #=> /path/file:lineNumber
 filelists/{drive.key} # => line-separated list of files. (mounts excluded)
 ```
