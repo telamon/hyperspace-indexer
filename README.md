@@ -1,6 +1,6 @@
 [`pure | 📦`](https://github.com/telamon/create-pure)
 [`code style | standard`](https://standardjs.com/)
-# 🕷️🤖 hyper-indexer
+# 🕷️🤖 hyperspace-indexer
 
 > Index hyper:// links
 
