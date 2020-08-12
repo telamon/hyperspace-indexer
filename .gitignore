@@ -7,3 +7,4 @@
 !test.js
 !.editorconfig
 !.gitignore
+!lib/*.js

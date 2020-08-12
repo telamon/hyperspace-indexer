@@ -4,10 +4,11 @@
   "description": "Index hyper:// links",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
+    "start": "node --trace-uncaught --trace-warnings  --trace-exit --trace-sigint index.js",
+    "seed": "node --trace-uncaught --trace-warnings  --trace-exit --trace-sigint index.js seed",
     "lint": "standard",
     "test": "tape test.js",
-    "debug": "node inspect $(npm bin)/tape test.js",
+    "debug": "node inspect --trace-uncaught --trace-warnings  --trace-exit --trace-sigint $(npm bin)/tape test.js",
     "prepublishOnly": "standard && npm test"
   },
   "repository": {
