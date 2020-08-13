@@ -225,32 +225,38 @@ class Indexer {
 
   async _crawlDrive (drive) {
     log('fetching file-list')
-
-    const list = await defer(done => {
-      const timer = setTimeout(() => done(new Error('READDIR_TIMEOUT')), IDLE_TIMEOUT)
-      drive.readdir('/', { recursive: true, noMounts: true }, (err, l) => {
-        clearTimeout(timer)
-        done(err, l)
-      })
-    })
-    log('Filelist received:', list)
-    if (!list || !list.length) return null
-
-    // Ignore drives which whoose version has already been processed.
+    const prevState = {
+      version: 0,
+      size: 0,
+      files: 0,
+      updatedAt: -1
+    }
     try {
-      const prevState = await defer(d => this._dist.readFile(`about/${drive.key.hexSlice()}`, d))
-      if (drive.version <= JSON.parse(prevState.toString()).version) {
+      const info = await defer(d => this._dist.readFile(`about/${drive.key.hexSlice()}`, d))
+      Object.assign(prevState, JSON.parse(info.toString()))
+      if (drive.version <= prevState.version) {
         log('=== Drive is up-to-date', drive.key.hexSlice())
         return null
       }
     } catch (err) {
-      log('No previous entry?', drive.key.hexSlice(), err)
+      if (err.code === 'ENOENT') log('New drive detected', drive.key.hexSlice())
+      else throw err
     }
 
-    // Give people a chance to opt-out of indexing
-    if (list.find(file => file.match(/\.nocrawl$/))) return null
+    const list = []
+    const stream = drive.createDiffStream(prevState.version, '/')
+    stream.on('data', entry => {
+      console.log(entry.seq, entry.type, entry.name, entry.value.size)
+      // TODO: .goto format has 0 size, don't know how it works yet but it's gonna be skipped here.
+      if (entry.type === 'put' && entry.value.isFile() && entry.value.size) list.push(entry)
+    })
+    await defer(d => eos(stream, d))
 
-    const aggr = { size: 0, files: 0, updatedAt: -1 }
+    log('Filelist received:', list.map(e => e.name))
+    if (!list || !list.length) return null
+
+    // Give people a chance to opt-out of indexing
+    if (list.find(entry => entry.name.match(/\.nocrawl$/))) return null
 
     await defer(indexingDone => {
       const que = new NanoQueue(PARALLEL_FILES, {
@@ -270,24 +276,26 @@ class Indexer {
           indexingDone()
         }
       })
-      que.push(() => this._writeEntry(`filelists/${drive.key.hexSlice()}`, list.join('\n')))
 
       const context = {
         drive,
         log,
         readRemoteFile,
-        driveInfo: aggr,
+        driveInfo: prevState,
         writeEntry: this._writeEntry.bind(this),
         index: this.index.bind(this)
       }
 
-      for (const file of list) {
+      for (const entry of list) {
+        const file = entry.name
+        const seq = entry.seq
         log('Processing file', file)
         const boundCtx = {
           ...context,
-          setPreview: this._setPreview.bind(this, drive, file)
+          seq,
+          setPreview: this._setPreview.bind(this, drive, file, seq)
         }
-        if (file.match(/^index.json$/i)) que.push(() => this._indexJson(aggr, drive, file))
+        if (file.match(/^index.json$/i)) que.push(() => this._indexJson(prevState, drive, file))
 
         // Perform analysis based on file-extension
         if (file.match(/\.(md|txt)$/i)) que.push(() => analyzeText(boundCtx, file))
@@ -296,28 +304,36 @@ class Indexer {
         // if (file.match(/\.svg$/i)) que.push(() => analyzeVectorImage(context, file))
 
         // TODO: analyze html + find links
-        que.push(() => this._appendUpdates(aggr, drive, file))
+        que.push(() => this._appendUpdates(boundCtx, file))
       }
     })
-    return aggr
+
+    // TODO: have to put readdir('/') op back for this..
+    // filelists/ index indexes all files available, not just those analyzed with previews.
+    // que.push(() => this._writeEntry(`filelists/${drive.key.hexSlice()}`, list.map(n => n.name).join('\n')))
+    return prevState
   }
 
   async _indexJson (aggr, drive, file) {
     const { body } = await readRemoteFile(drive, file)
-    Object.assign(aggr, JSON.parse(body.toString('utf8')))
+    const { version, size, files, updatedAt } = aggr
+    Object.assign(
+      aggr,
+      JSON.parse(body.toString('utf8')),
+      { version, size, files, updatedAt } // prevent accidental owerwrite
+    )
   }
 
-  async _appendUpdates (aggr, drive, file) {
+  async _appendUpdates ({ driveInfo, drive, seq }, file) {
     const fstat = await defer(d => drive.lstat(file, { wait: true }, d))
-    aggr.files++
-    aggr.size += fstat.size
+    driveInfo.files++
+    driveInfo.size += fstat.size
     const remoteTime = fstat.mtime.getTime()
     const subPath = [fstat.mtime.getFullYear(), fstat.mtime.getMonth(), fstat.mtime.getDate()].join('/')
     const key = `updates/${subPath}/${drive.key.hexSlice()}_${file.replace(/\//g, '+')}`
     if (remoteTime > new Date().getTime()) throw new Error('Drive contains files from the future', fstat.mtime, key)
-    if (aggr.updatedAt < remoteTime) aggr.updatedAt = remoteTime
-    // await this._writeEntry(key, `${drive.version}`)
-    await this._symlink(previewPath(drive, file, drive.version), key)
+    if (driveInfo.updatedAt < remoteTime) driveInfo.updatedAt = remoteTime
+    await this._writeEntry(key, `${seq}`)
   }
 
   async _writeEntry (key, value, force = false) {
@@ -342,9 +358,9 @@ class Indexer {
     return true
   }
 
-  async _setPreview (drive, file, data) {
+  async _setPreview (drive, file, seq, data) {
     const link = previewPath(drive, file)
-    const content = previewPath(drive, file, drive.version)
+    const content = previewPath(drive, file, seq)
     // Use symlink hack to store version information and avoid having to compare contents.
     // any data added to the drive is forever stuck in history anyway so no point to clean up old-versions.
     const written = await this._writeEntry(content, data)
