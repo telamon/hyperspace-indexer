@@ -26,9 +26,11 @@
     "end-of-stream": "^1.4.4",
     "hyperdrive": "^10.17.0",
     "hyperswarm": "^2.15.0",
+    "moment": "^2.27.0",
     "nanoqueue": "^1.0.0",
     "node-html-parser": "^1.2.20",
-    "sbd": "^1.0.18"
+    "sbd": "^1.0.18",
+    "sharp": "^0.25.4"
   },
   "devDependencies": {
     "standard": "^14.3.4",

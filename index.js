@@ -6,14 +6,16 @@ const { parse } = require('node-html-parser')
 const hyperswarm = require('hyperswarm')
 const { discoveryKey } = require('hypercore-crypto')
 const eos = require('end-of-stream')
+const moment = require('moment')
 const analyzeText = require('./lib/analyzer_text.js')
+const analyzeImage = require('./lib/analyzer_image.js')
 
 const MINGLE_TIMEOUT = 1000 * 5
-const DOWNLOAD_TIMEOUT = 1000 * 60
-const IDLE_TIMEOUT = 1000 * 60
-const REINDEX_THRESHOLD = 1000 * 60 * 60 * 1 // 1hour
-const PARALLELIZATION = 6
-const PARALLEL_FILES = 5
+const DOWNLOAD_TIMEOUT = 1000 * 60 * 2 // Wait 2 minutes for download to succeed
+const IDLE_TIMEOUT = 1000 * 30
+const REINDEX_THRESHOLD = 1000 * 60 * 20 // 1hour, not really needed due to createDiffStream()
+const PARALLELIZATION = 5
+const PARALLEL_FILES = 10
 
 const hyperdrive = require('hyperdrive')
 const log = (...args) => console.log(new Date().toJSON(), '[Indexer]', ...args)
@@ -69,8 +71,6 @@ class Indexer {
     })
     this._drives = {}
     this._dist = hyperdrive('./dist')
-    // this.client = new HyperspaceClient()
-    this._lastIndexed = {}
     this._dist.on('ready', async () => {
       console.log(`Database url: hyper://${this._dist.key.hexSlice()}`)
       await this._writeEntry('.nocrawl', 'nocrawl')
@@ -146,7 +146,7 @@ class Indexer {
     const stat = await defer(d => this._dist.lstat(`about/${key.hexSlice()}`, (_, s) => d(null, s)))
     if (stat && new Date().getTime() - stat.mtime.getTime() < REINDEX_THRESHOLD) return
     log('Start processing drive', url.toString())
-
+    if (this._drives[key.toString('hex')]) return log('already being processed')
     const drive = this._getDrive(key)
     await defer(d => drive.ready(d))
     const topic = discoveryKey(key)
@@ -220,10 +220,22 @@ class Indexer {
 
     // TODO: write about index.json + nNpeers
     if (about) log('Drive complete and closed', url.toString(), about)
-    else log('empty drive skipped')
   }
 
   async _crawlDrive (drive) {
+    // TODO: add diffStream rollback to retry failed files
+
+    try {
+      // read remote will fetch fstat and hopefully quickreturn,
+      // if the instruction suceeds then a .nocrawl file exists
+      // we'll crawl into another direction.
+      await readRemoteFile(drive, '.nocrawl')
+      log('Drive politely skipped due to ".nocrawl" request')
+      return null
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err
+    }
+
     log('fetching file-list')
     const prevState = {
       version: 0,
@@ -245,18 +257,22 @@ class Indexer {
 
     const list = []
     const stream = drive.createDiffStream(prevState.version, '/')
+    let timer = null
+    const readdir = defer(d => {
+      // Let the race begin
+      timer = setTimeout(d.bind(null, new Error('READDIR_TIMEOUT')), IDLE_TIMEOUT)
+      eos(stream, d)
+    })
+
     stream.on('data', entry => {
-      console.log(entry.seq, entry.type, entry.name, entry.value.size)
+      clearTimeout(timer)
+      // console.log(entry.seq, entry.type, entry.name, entry.value.size)
       // TODO: .goto format has 0 size, don't know how it works yet but it's gonna be skipped here.
       if (entry.type === 'put' && entry.value.isFile() && entry.value.size) list.push(entry)
     })
-    await defer(d => eos(stream, d))
-
+    await readdir
     log('Filelist received:', list.map(e => e.name))
     if (!list || !list.length) return null
-
-    // Give people a chance to opt-out of indexing
-    if (list.find(entry => entry.name.match(/\.nocrawl$/))) return null
 
     await defer(indexingDone => {
       const que = new NanoQueue(PARALLEL_FILES, {
@@ -290,6 +306,7 @@ class Indexer {
         const file = entry.name
         const seq = entry.seq
         log('Processing file', file)
+
         const boundCtx = {
           ...context,
           seq,
@@ -300,7 +317,7 @@ class Indexer {
         // Perform analysis based on file-extension
         if (file.match(/\.(md|txt)$/i)) que.push(() => analyzeText(boundCtx, file))
         // if (file.match(/\.html?$/i)) que.push(() => analyzeHTML(context, file))
-        // if (file.match(/\.(png|jpe?g|gif)$/i)) que.push(() => analyzeImage(context, file))
+        if (file.match(/\.(png|jpe?g|svg|webp)$/i)) que.push(() => analyzeImage(boundCtx, file))
         // if (file.match(/\.svg$/i)) que.push(() => analyzeVectorImage(context, file))
 
         // TODO: analyze html + find links
@@ -328,9 +345,11 @@ class Indexer {
     const fstat = await defer(d => drive.lstat(file, { wait: true }, d))
     driveInfo.files++
     driveInfo.size += fstat.size
+    // We're only interested in media atm.
+    if (!file.match(/\.(md|html|txt|png|jpe?g|svg|webm|gif|mpe?g|ogg|mp3)$/i)) return // Skip update-records for non-analyzed files.
     const remoteTime = fstat.mtime.getTime()
-    const subPath = [fstat.mtime.getFullYear(), fstat.mtime.getMonth(), fstat.mtime.getDate()].join('/')
-    const key = `updates/${subPath}/${drive.key.hexSlice()}_${file.replace(/\//g, '+')}`
+    // const subPath = moment(fstat.mtime).format('YYYY/MM/DD') // Skipping this for now.
+    const key = `updates/${remoteTime}_${drive.key.hexSlice()}_${file.replace(/\//g, '+')}` // TODO: prolly safer to use \u0001 instead of '+'
     if (remoteTime > new Date().getTime()) throw new Error('Drive contains files from the future', fstat.mtime, key)
     if (driveInfo.updatedAt < remoteTime) driveInfo.updatedAt = remoteTime
     await this._writeEntry(key, `${seq}`)
@@ -377,9 +396,19 @@ function previewPath (drive, file, version = null) {
   return k
 }
 
-async function readRemoteFile (drive, file, maxSize = 1024 * 1024 * 10) {
-  const fstat = await defer(d => drive.lstat(file, { wait: true }, d))
+async function readRemoteFile (drive, file, maxSize = 1024 * 1024 * 5, raw = false) {
+  // Fetch the stat first
+  const fstat = await defer(d => {
+    const timer = setTimeout(() => d(new Error('DOWNLOAD_TIMEOUT')), DOWNLOAD_TIMEOUT)
+    drive.lstat(file, { wait: true }, (err, stat) => {
+      clearTimeout(timer)
+      d(err, stat)
+    })
+  })
+
+  // Return stat if body is empty, oversize body is treated as empty file: "ignored".
   if (!fstat.size || fstat.size > maxSize) return { fstat, body: null }
+
   const body = await defer(d => {
     log('downloading...', file)
     const timer = setTimeout(() => d(new Error('DOWNLOAD_TIMEOUT')), DOWNLOAD_TIMEOUT)
@@ -390,7 +419,7 @@ async function readRemoteFile (drive, file, maxSize = 1024 * 1024 * 10) {
       if (err) return d(err)
       drive.readFile(file, (err, chunk) => {
         if (err) return d(err)
-        d(null, chunk.toString('utf8'))
+        d(null, raw ? chunk : chunk.toString('utf8'))
       })
     })
   })
@@ -436,17 +465,24 @@ if (require.main === module) {
     fetchUserDirectory()
 
     const crawl = () => {
-      drives.sort((a, b) => Math.random() - 0.5)
+      // drives.sort((a, b) => Math.random() - 0.5)
       for (const drive of drives) {
         idxr.index(drive.url)
       }
       setTimeout(crawl, 30 * 60 * 1000)
     }
     setTimeout(crawl, 60 * 1000)
-  } else if (process.argv[2] === 'readdir') {
-    idxr._dist.readdir(process.argv[3], { recursive: true, noMounts: true }, (err, res) => {
+    // All the additional CLI commands here were added in hindsight. todo: refactor.
+  } else if (process.argv[2] === 'ls') {
+    idxr._dist.readdir(process.argv[3] || '/', { recursive: true, noMounts: true }, (err, res) => {
       if (err) return log('readdir failed!', err)
       for (const line of res) console.log(line)
+      console.log('Drive version', idxr._dist.version)
+    })
+  } else if (process.argv[2] === 'cat') {
+    idxr._dist.readFile(process.argv[3], (err, res) => {
+      if (err) return log('cat failed!', err)
+      console.log(res.toString('utf8'))
     })
   } else if (process.argv[2] === 'scrape') {
     const drives = scrape()
