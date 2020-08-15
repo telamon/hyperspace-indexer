@@ -7,4 +7,5 @@
 !test.js
 !.editorconfig
 !.gitignore
-!lib/
+!lib/analyzer_image.js
+!lib/analyzer_text.js

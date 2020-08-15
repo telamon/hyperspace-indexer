@@ -6,15 +6,16 @@ const { parse } = require('node-html-parser')
 const hyperswarm = require('hyperswarm')
 const { discoveryKey } = require('hypercore-crypto')
 const eos = require('end-of-stream')
-const moment = require('moment')
+// const moment = require('moment')
 const analyzeText = require('./lib/analyzer_text.js')
 const analyzeImage = require('./lib/analyzer_image.js')
 
 /*
  * Amount of drives to index in parallel.
  * This setting trips up OS-resource limits fast.
+ * ( Set it to `1` during debugging to avoid hair-loss )
  */
-const PARALLELIZATION = 5
+const PARALLELIZATION = 6
 
 /*
  * Amount of files to be analyze in parallel for each drive.
@@ -29,17 +30,17 @@ const DRIVE_FAIL_THRESHOLD = 10
 /*
  * Wait time to discover new drive versions on topic join.
  */
-const MINGLE_TIMEOUT = 1000 * 5
+const MINGLE_TIMEOUT = 1000 * 10
 
 /*
  * Wait msecs before giving up on downloading a file.
  */
-const DOWNLOAD_TIMEOUT = 1000 * 60 * 2 // Wait 2 minutes for download to succeed
+const DOWNLOAD_TIMEOUT = 1000 * 30
 
 /*
  * How long to wait for peer discovery and connection
  */
-const IDLE_TIMEOUT = 1000 * 30
+const IDLE_TIMEOUT = 1000 * 60
 
 /*
  * Once a drive has been indexed, give it REINDEX_THRESHOLD time to cool off
@@ -55,54 +56,11 @@ const DRIVE_TIMEOUT = 1000 * 60 * 5
 const hyperdrive = require('hyperdrive')
 const log = (...args) => console.log(new Date().toJSON(), '[Indexer]', ...args)
 
-async function scrape () {
-  const res = await defer(done => https.get('https://userlist.beakerbrowser.com/', done.bind(null, null)))
-  log('Connection established')
-  const html = await defer(done => {
-    let body = ''
-    res.on('data', chunk => { body += chunk })
-    res.on('end', () => done(null, body))
-    res.on('error', err => done(err))
-  })
-  const root = parse(html)
-  // html.match(/<a href="hyper:\/\/([^"]+)".*>/)
-  const users = []
-  for (const node of root.querySelector('.users.mainlist').childNodes) {
-    if (node.nodeType !== 1) continue
-    const link = node.querySelector('a')
-    const url = link.getAttribute('href')
-    const name = link.text
-    const peerCount = node.querySelector('.peer-count').getAttribute('data-peer-count')
-    const detailsNode = node.querySelector('.details')
-    users.push({
-      name,
-      url,
-      peerCount,
-      details: detailsNode ? detailsNode.text : null
-    })
-  }
-  return users
-}
-
-function resolveKey (url) {
-  // dat-dns? What's used in beaker to resolve hyper://?
-  if (Buffer.isBuffer(url)) {
-    if (url.length === 32) return url
-    throw new Error(`Unknown buffer received as URL: ${url.hexSlice()}`)
-  }
-  const isHexkey = str => typeof str === 'string' && str.length === 64 && str.match(/^[a-f0-9]+$/)
-  if (isHexkey(url)) return Buffer.from(url, 'hex')
-
-  const u = new URL(url)
-  if (isHexkey(u.host)) return Buffer.from(u.host, 'hex')
-  throw new Error('dns lookups not yet implemented', url)
-}
-
 class Indexer {
   constructor () {
     this.queue = new NanoQueue(PARALLELIZATION, {
       process: this._process.bind(this),
-      oncomplete: log.bind(null, 'Queue finished')
+      oncomplete: () => log('Queue finished', this._dist.version)
     })
     this._drives = {}
     this._dist = hyperdrive('./dist')
@@ -136,7 +94,9 @@ class Indexer {
     })
   }
 
-  async ready () { } // return this.client.ready() }
+  async ready () {
+    return defer(d => this._dist.ready(d))
+  }
 
   index (url, force = false) {
     // TODO: if !force refuse to process drives that already were indexed during the last 6 hours
@@ -149,8 +109,8 @@ class Indexer {
     const storage = `_cache/${key.toString('hex')}`
     drive = this._drives[key.toString('hex')] = hyperdrive(storage, key, { sparse: true })
     drive.on('error', console.error.bind(null, 'HyperdriveError'))
-    // drive.on('ready', console.error.bind(null, 'HyperdriveReady'))
-    return drive
+    return defer(d => drive.ready(d))
+      .then(() => drive)
   }
 
   async _releaseDrive (drive) {
@@ -159,17 +119,20 @@ class Indexer {
       // await defer(d => drive.destroyStorage(d))
       await defer(d => drive.close(d))
     } catch (err) {
-      log('Failed closing drive', err)
+      return log('Failed closing drive', err)
     } finally {
       delete this._drives[key.toString('hex')]
     }
+    log('Drive closed', key.hexSlice())
   }
 
   _process (url, done) {
+    log('^ SLOT allocated', this._dist.version, url)
     this._joinSwarm(url)
+      .then(() => log('$ SLOT freed success', this._dist.version, url))
       .then(done.bind(null, null))
       .catch(err => {
-        console.error('Failed processing', err)
+        console.error('$ SLOT freed due to err', this._dist.version, err)
         done()
       })
   }
@@ -179,11 +142,10 @@ class Indexer {
     if (!key) throw new Error('KeyResolutionFailure')
     // TODO: index only if hasn't been indexed within 2hours, use the `about/{drive.key}` index for lookup.
     const stat = await defer(d => this._dist.lstat(`about/${key.hexSlice()}`, (_, s) => d(null, s)))
-    if (stat && new Date().getTime() - stat.mtime.getTime() < REINDEX_THRESHOLD) return
+    if (stat && new Date().getTime() - stat.mtime.getTime() < REINDEX_THRESHOLD) return log('Drive is cooling')
     log('Start processing drive', url.toString())
     if (this._drives[key.toString('hex')]) return log('already being processed')
-    const drive = this._getDrive(key)
-    await defer(d => drive.ready(d))
+    const drive = await this._getDrive(key)
     const topic = discoveryKey(key)
     const swarm = hyperswarm({
       multiplex: false,
@@ -197,39 +159,42 @@ class Indexer {
       uniquePeers[peer.host] = true
     })
     swarm.on('connection', (socket, info) => {
-      log('Connection established', info.peer && info.peer.host)
-      sockets.push(socket)
-      eos(socket, () => {
-        sockets.splice(sockets.indexOf(socket), 1)
-      })
       // const { type, client, topics, peer } = info
       // const { host, local, referrer, topic } = peer
+      log('Connection established', info.peer && info.peer.host)
+      sockets.push(socket)
+      eos(socket, err => {
+        log('Socket Closed', err && err.message === 'Readable stream closed before ending' ? 'read error' : err)
+        const idx = sockets.indexOf(socket)
+        if (~idx) sockets.splice(idx, 1)
+      })
       const dstream = drive.replicate(info.client, { live: true, encrypt: true })
       dstream.on('error', err => {
-        if (err.message === 'Resource is closed') return
-        console.warn('!!! Replication failure', url.toString(), err)
+        if (err.message === 'Resource is closed') log('!!! Replication failure', err.message)
+        else console.warn('!!! Replication failure', url.toString(), err)
       })
-      dstream.on('end', log.bind(null, 'replication finished'))
+      dstream.on('close', log.bind(null, 'drive-replication stream closed'))
       dstream.pipe(socket).pipe(dstream)
     })
 
     const swarmJoinedLock = defer(unlock => {
-      const idleTimer = setTimeout(() => { throw new Error('IDLE_TIMEOUT') }, IDLE_TIMEOUT)
+      const idleTimer = setTimeout(unlock.bind(null, new Error('IDLE_TIMEOUT')), IDLE_TIMEOUT)
       swarm.join(topic, { lookup: true, announce: false }, () => {
-        log('topic joined')
         clearTimeout(idleTimer)
         unlock()
       })
     })
-
+    log('Swarm Initialized, waiting for peers', url)
     // Clean up resources on failure.
+    let crawlError = null
     try {
       await swarmJoinedLock
-
+      log('topic joined, waiting for updates', topic.toString('hex'))
       // Not sure if mingling is necessary, trying to avoid empty drive.readdir()
       await defer(d => setTimeout(d, MINGLE_TIMEOUT))
 
       // Crawl content
+      log('crawlDrive() start', url)
       const about = await this._crawlDrive(drive)
 
       // Store descriptor (done here because of uniquePeers availablility)
@@ -240,14 +205,21 @@ class Indexer {
         log('+++ Drive finished new state written', about.version, url.toString(), about)
       }
     } catch (err) {
-      if (err.message !== 'IDLE_TIMEOUT' || err.message !== 'READDIR_TIMEOUT') throw err
+      // const ignoredErrors = ['IDLE_TIMEOUT', 'READDIR_TIMEOUT', 'DOWNLOAD_TIMEOUT']
+      // if (ignoredErrors.find(m => err.message === m)) return
+      log('crawlDrive() failed', url, err)
+      crawlError = err
     } finally {
       // Free resources
-      await defer(done => swarm.leave(topic, done))
+      await defer(done => swarm.leave(topic, err => {
+        log('Topic left', topic.hexSlice(), err)
+        done(err)
+      }))
       await this._releaseDrive(drive)
       for (const socket of sockets) socket.end()
     }
-    log('Drive closed')
+    log('Drive resources released', url.toString())
+    if (crawlError) throw crawlError
   }
 
   async _crawlDrive (drive) {
@@ -264,7 +236,7 @@ class Indexer {
       if (err.code !== 'ENOENT') throw err
     }
 
-    log('fetching file-list')
+    log('Comparing version to cached state')
     const prevState = {
       version: 0,
       size: 0,
@@ -283,21 +255,31 @@ class Indexer {
       else throw err
     }
 
+    log('fetching file-list', prevState.version, '=>', drive.version)
     const list = []
     const stream = drive.createDiffStream(prevState.version, '/')
-    let timer = null
     const readdir = defer(d => {
       // Let the race begin
-      timer = setTimeout(d.bind(null, new Error('READDIR_TIMEOUT')), IDLE_TIMEOUT)
-      eos(stream, d)
+      const timer = setTimeout(() => {
+        stream.destroy(new Error('READDIR_TIMEOUT'))
+      }, IDLE_TIMEOUT)
+
+      const onEnd = err => {
+        log('diffStream ended', err || '')
+        clearTimeout(timer)
+        d(err)
+      }
+      stream.on('error', onEnd)
+      stream.on('close', onEnd)
     })
 
     stream.on('data', entry => {
-      clearTimeout(timer)
-      // console.log(entry.seq, entry.type, entry.name, entry.value.size)
+      log(entry.seq, entry.type, entry.name, entry.value && entry.value.size)
       // TODO: .goto format has 0 size, don't know how it works yet but it's gonna be skipped here.
       if (entry.type === 'put' && entry.value.isFile() && entry.value.size) list.push(entry)
     })
+
+    log('Waiting for list', IDLE_TIMEOUT / 1000, 'seconds')
     await readdir
     log('Filelist received:', list.map(e => e.name))
     if (!list || !list.length) return null
@@ -450,9 +432,16 @@ function previewPath (drive, file, version = null) {
 }
 
 async function readRemoteFile (drive, file, maxSize = 1024 * 1024 * 5, raw = false) {
+  // make the stackTrace a bit more interesting
+  let pickledError = null
+  try { throw new Error('DOWNLOAD_TIMEOUT') } catch (err) { pickledError = err }
+  pickledError.file = file
+
   // Fetch the stat first
   const fstat = await defer(d => {
-    const timer = setTimeout(() => d(new Error('DOWNLOAD_TIMEOUT')), DOWNLOAD_TIMEOUT)
+    const timer = setTimeout(() => {
+      d(pickledError)
+    }, DOWNLOAD_TIMEOUT)
     drive.lstat(file, { wait: true }, (err, stat) => {
       clearTimeout(timer)
       d(err, stat)
@@ -479,6 +468,49 @@ async function readRemoteFile (drive, file, maxSize = 1024 * 1024 * 5, raw = fal
   return { fstat, body }
 }
 
+async function scrape () {
+  const res = await defer(done => https.get('https://userlist.beakerbrowser.com/', done.bind(null, null)))
+  log('Connection established')
+  const html = await defer(done => {
+    let body = ''
+    res.on('data', chunk => { body += chunk })
+    res.on('end', () => done(null, body))
+    res.on('error', err => done(err))
+  })
+  const root = parse(html)
+  // html.match(/<a href="hyper:\/\/([^"]+)".*>/)
+  const users = []
+  for (const node of root.querySelector('.users.mainlist').childNodes) {
+    if (node.nodeType !== 1) continue
+    const link = node.querySelector('a')
+    const url = link.getAttribute('href')
+    const name = link.text
+    const peerCount = node.querySelector('.peer-count').getAttribute('data-peer-count')
+    const detailsNode = node.querySelector('.details')
+    users.push({
+      name,
+      url,
+      peerCount,
+      details: detailsNode ? detailsNode.text : null
+    })
+  }
+  return users
+}
+
+function resolveKey (url) {
+  // dat-dns? What's used in beaker to resolve hyper://?
+  if (Buffer.isBuffer(url)) {
+    if (url.length === 32) return url
+    throw new Error(`Unknown buffer received as URL: ${url.hexSlice()}`)
+  }
+  const isHexkey = str => typeof str === 'string' && str.length === 64 && str.match(/^[a-f0-9]+$/)
+  if (isHexkey(url)) return Buffer.from(url, 'hex')
+
+  const u = new URL(url)
+  if (isHexkey(u.host)) return Buffer.from(u.host, 'hex')
+  throw new Error('dns lookups not yet implemented', url)
+}
+
 module.exports = {
   scrape,
   Indexer
@@ -486,45 +518,59 @@ module.exports = {
 
 // when `node index.js`
 if (require.main === module) {
+  process.on('beforeExit', log.bind(null, '[Node] beforeExit'))
+  process.on('exit', log.bind(null, '[Node] exit'))
+  process.on('multipleResolves', log.bind(null, '[Node] multipleResolves'))
+  process.on('unhandledRejection', log.bind(null, '[Node] unhandledRejection'))
+  process.on('uncaughtException', log.bind(null, '[Node] uncaughtException'))
+  process.on('warning', log.bind(null, '[Node] warning'))
+
   const { writeFileSync } = require('fs')
   const idxr = new Indexer()
   const distribute = () => {
-    idxr._dist.on('ready', () => {
-      idxr.replicate()
-      writeFileSync('database.url', `hyper://${idxr._dist.key.hexSlice()}`)
-    })
+    return idxr.ready()
+      .then(() => {
+        idxr.replicate()
+        writeFileSync('database.url', `hyper://${idxr._dist.key.hexSlice()}`)
+      })
   }
 
   if (!process.argv[2]) {
-    distribute()
+    log('Booting up indexer, normal crawl mode')
     let drives = []
-    const fetchUserDirectory = () => {
-      scrape()
+    const updateDrives = () => {
+      log('Scraping userlist')
+      return scrape()
         .then(d => {
           drives = d
           drives.sort((a, b) => Math.random() - 0.5)
-          // writeFileSync('drives.json', JSON.stringify(drives))
-          // await idxr.ready()
-          for (const drive of drives) {
-            idxr.index(drive.url)
-          }
         })
-        .catch(err => {
-          console.error('Indexing failed', err)
-        })
-
-      setTimeout(fetchUserDirectory, 6 * 60 * 60 * 1000)
     }
-    fetchUserDirectory()
-
-    const crawl = () => {
+    const crawlDrives = () => {
+      log('Enqueing drives', drives.length)
       drives.sort((a, b) => Math.random() - 0.5)
       for (const drive of drives) {
         idxr.index(drive.url)
       }
-      setTimeout(crawl, 30 * 60 * 1000)
     }
-    setTimeout(crawl, 60 * 1000)
+
+    distribute()
+      .then(updateDrives)
+      .then(crawlDrives)
+      .then(() => { // start timers
+        // Recrawl timer
+        setInterval(crawlDrives, 30 * 60 * 1000) // Randomly requeue userlist every 30mins
+
+        // Rescrape timer
+        setInterval(() => {
+          return updateDrives()
+            .catch(err => {
+              console.error('Indexing failed', err)
+            })
+        }, 1000 * 60 * 60) // Rescrape every hour
+      })
+      .catch(err => log('Failed booting the indexer', err))
+
     // All the additional CLI commands here were added in hindsight. todo: refactor.
   } else if (process.argv[2] === 'ls') {
     idxr._dist.readdir(process.argv[3] || '/', { recursive: true, noMounts: true }, (err, res) => {
@@ -544,6 +590,6 @@ if (require.main === module) {
     distribute()
   } else {
     distribute()
-    idxr.index(process.argv[2], true)
+      .then(() => idxr.index(process.argv[2], true))
   }
 }
