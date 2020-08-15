@@ -10,12 +10,47 @@ const moment = require('moment')
 const analyzeText = require('./lib/analyzer_text.js')
 const analyzeImage = require('./lib/analyzer_image.js')
 
-const MINGLE_TIMEOUT = 1000 * 5
-const DOWNLOAD_TIMEOUT = 1000 * 60 * 2 // Wait 2 minutes for download to succeed
-const IDLE_TIMEOUT = 1000 * 30
-const REINDEX_THRESHOLD = 1000 * 60 * 20 // 1hour, not really needed due to createDiffStream()
+/*
+ * Amount of drives to index in parallel.
+ * This setting trips up OS-resource limits fast.
+ */
 const PARALLELIZATION = 5
+
+/*
+ * Amount of files to be analyze in parallel for each drive.
+ */
 const PARALLEL_FILES = 10
+
+/*
+ * Maximum amount of errors to tolerate before skipping a drive
+ */
+const DRIVE_FAIL_THRESHOLD = 10
+
+/*
+ * Wait time to discover new drive versions on topic join.
+ */
+const MINGLE_TIMEOUT = 1000 * 5
+
+/*
+ * Wait msecs before giving up on downloading a file.
+ */
+const DOWNLOAD_TIMEOUT = 1000 * 60 * 2 // Wait 2 minutes for download to succeed
+
+/*
+ * How long to wait for peer discovery and connection
+ */
+const IDLE_TIMEOUT = 1000 * 30
+
+/*
+ * Once a drive has been indexed, give it REINDEX_THRESHOLD time to cool off
+ * before allowing it to be checked for updates again.
+ */
+const REINDEX_THRESHOLD = 1000 * 60 * 20
+
+/*
+ * Maximum amount of time to spend indexing one drive.
+ */
+const DRIVE_TIMEOUT = 1000 * 60 * 5
 
 const hyperdrive = require('hyperdrive')
 const log = (...args) => console.log(new Date().toJSON(), '[Indexer]', ...args)
@@ -161,9 +196,6 @@ class Indexer {
     swarm.on('peer', peer => {
       uniquePeers[peer.host] = true
     })
-    let unlock = null
-    const lock = defer(d => { unlock = d })
-
     swarm.on('connection', (socket, info) => {
       log('Connection established', info.peer && info.peer.host)
       sockets.push(socket)
@@ -175,39 +207,37 @@ class Indexer {
       const dstream = drive.replicate(info.client, { live: true, encrypt: true })
       dstream.on('error', err => {
         if (err.message === 'Resource is closed') return
-        console.warn('!!! Replication failure', err)
+        console.warn('!!! Replication failure', url.toString(), err)
       })
       dstream.on('end', log.bind(null, 'replication finished'))
       dstream.pipe(socket).pipe(dstream)
-      // TODO: fetch list of files,
     })
 
-    swarm.join(topic, { lookup: true, announce: false }, () => {
-      log('topic joined')
-      unlock()
+    const swarmJoinedLock = defer(unlock => {
+      const idleTimer = setTimeout(() => { throw new Error('IDLE_TIMEOUT') }, IDLE_TIMEOUT)
+      swarm.join(topic, { lookup: true, announce: false }, () => {
+        log('topic joined')
+        clearTimeout(idleTimer)
+        unlock()
+      })
     })
-    let about = null
+
+    // Clean up resources on failure.
     try {
-      let state = 0
-      setTimeout(() => {
-        if (!state) throw new Error('IDLE_TIMEOUT')
-      }, IDLE_TIMEOUT)
+      await swarmJoinedLock
 
-      await lock
-      state++
       // Not sure if mingling is necessary, trying to avoid empty drive.readdir()
       await defer(d => setTimeout(d, MINGLE_TIMEOUT))
-      state++
 
       // Crawl content
-      about = await this._crawlDrive(drive)
-      state++
+      const about = await this._crawlDrive(drive)
 
       // Store descriptor (done here because of uniquePeers availablility)
       if (about) {
         about.peers = Object.keys(uniquePeers).length
         about.version = drive.version
         await this._writeEntry(`about/${drive.key.hexSlice()}`, JSON.stringify(about), true)
+        log('+++ Drive finished new state written', about.version, url.toString(), about)
       }
     } catch (err) {
       if (err.message !== 'IDLE_TIMEOUT' || err.message !== 'READDIR_TIMEOUT') throw err
@@ -217,9 +247,7 @@ class Indexer {
       await this._releaseDrive(drive)
       for (const socket of sockets) socket.end()
     }
-
-    // TODO: write about index.json + nNpeers
-    if (about) log('Drive complete and closed', url.toString(), about)
+    log('Drive closed')
   }
 
   async _crawlDrive (drive) {
@@ -275,21 +303,36 @@ class Indexer {
     if (!list || !list.length) return null
 
     await defer(indexingDone => {
+      // This is the main drive-file processing queue,
+      // to abort a drive indexing is to kill the queue between tasks.
+      let abortProcess = null
+      let nErr = 0
+      setTimeout(() => {
+        abortProcess = new Error('DRIVE_TIMEOUT')
+        indexingDone(abortProcess) // unsure about this line
+      }, DRIVE_TIMEOUT)
+
       const que = new NanoQueue(PARALLEL_FILES, {
         process (task, done) {
+          if (abortProcess) return done()
           task()
             .then(() => {
               log('Indexing task succeeded')
               done()
             })
             .catch(err => {
+              if (nErr++ > DRIVE_FAIL_THRESHOLD) {
+                abortProcess = new Error('DRIVE_FAIL_THRESHOLD')
+                indexingDone(abortProcess) // unsure about this line
+              }
               log('Indexing task failed', err)
               done()
             })
         },
         oncomplete () {
-          log('All drive tasks complete')
-          indexingDone()
+          if (abortProcess) return indexingDone()
+          log('All drive tasks', abortProcess ? 'Aborted!' : 'Complete')
+          indexingDone(abortProcess)
         }
       })
 
@@ -305,12 +348,14 @@ class Indexer {
       for (const entry of list) {
         const file = entry.name
         const seq = entry.seq
+        const stat = entry.value
         log('Processing file', file)
 
         const boundCtx = {
           ...context,
           seq,
-          setPreview: this._setPreview.bind(this, drive, file, seq)
+          stat,
+          setPreview: this._setPreview.bind(this, drive, file, seq, stat)
         }
         if (file.match(/^index.json$/i)) que.push(() => this._indexJson(prevState, drive, file))
 
@@ -355,13 +400,21 @@ class Indexer {
     await this._writeEntry(key, `${seq}`)
   }
 
-  async _writeEntry (key, value, force = false) {
+  async _writeEntry (key, value, force = false, metadata) {
     if (!force) {
       const entryStat = await defer(d => this._dist.lstat(key, (_, stat) => d(null, stat)))
       if (entryStat) return false
     }
     if (!Buffer.isBuffer(value)) value = Buffer.from(value)
-    await defer(d => this._dist.writeFile(key, value, d))
+    const opts = {}
+    if (metadata) {
+      opts.metadata = {}
+      for (const mk in metadata) {
+        if (!Buffer.isBuffer(metadata[mk])) opts.metadata[mk] = Buffer.from(JSON.stringify(metadata[mk]))
+        else opts.metadata[mk] = metadata[mk]
+      }
+    }
+    await defer(d => this._dist.writeFile(key, value, opts, d))
     log('+++ Entry written', key)
     return true
   }
@@ -377,12 +430,12 @@ class Indexer {
     return true
   }
 
-  async _setPreview (drive, file, seq, data) {
+  async _setPreview (drive, file, seq, stat, data) {
     const link = previewPath(drive, file)
     const content = previewPath(drive, file, seq)
     // Use symlink hack to store version information and avoid having to compare contents.
     // any data added to the drive is forever stuck in history anyway so no point to clean up old-versions.
-    const written = await this._writeEntry(content, data)
+    const written = await this._writeEntry(content, data, false, { remoteStat: { mtime: stat.mtime, size: stat.size } })
     if (written) {
       const linked = await this._symlink(content, link, true)
       return linked
@@ -465,7 +518,7 @@ if (require.main === module) {
     fetchUserDirectory()
 
     const crawl = () => {
-      // drives.sort((a, b) => Math.random() - 0.5)
+      drives.sort((a, b) => Math.random() - 0.5)
       for (const drive of drives) {
         idxr.index(drive.url)
       }
