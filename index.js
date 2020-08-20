@@ -35,7 +35,7 @@ const MINGLE_TIMEOUT = 1000 * 10
 /*
  * Wait msecs before giving up on downloading a file.
  */
-const DOWNLOAD_TIMEOUT = 1000 * 30
+const DOWNLOAD_TIMEOUT = 1000 * 60
 
 /*
  * How long to wait for peer discovery and connection
@@ -575,8 +575,12 @@ if (require.main === module) {
   } else if (process.argv[2] === 'ls') {
     idxr._dist.readdir(process.argv[3] || '/', { recursive: true, noMounts: true }, (err, res) => {
       if (err) return log('readdir failed!', err)
-      for (const line of res) console.log(line)
-      console.log('Drive version', idxr._dist.version)
+      let nFiles = 0
+      for (const line of res) {
+        console.log(line)
+        nFiles++
+      }
+      console.log('Drive version', idxr._dist.version, `Path contains ${nFiles} records`)
     })
   } else if (process.argv[2] === 'cat') {
     idxr._dist.readFile(process.argv[3], (err, res) => {
