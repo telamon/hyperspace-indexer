@@ -9,7 +9,7 @@ const eos = require('end-of-stream')
 // const moment = require('moment')
 const analyzeText = require('./lib/analyzer_text.js')
 const analyzeImage = require('./lib/analyzer_image.js')
-
+const OFFLINE = process.env.OFFLINE || false
 /*
  * Amount of drives to index in parallel.
  * This setting trips up OS-resource limits fast.
@@ -30,7 +30,7 @@ const DRIVE_FAIL_THRESHOLD = 10
 /*
  * Wait time to discover new drive versions on topic join.
  */
-const MINGLE_TIMEOUT = 1000 * 10
+const MINGLE_TIMEOUT = OFFLINE ? 0 : 1000 * 20
 
 /*
  * Wait msecs before giving up on downloading a file.
@@ -93,12 +93,14 @@ class Indexer {
   }
 
   logProgress () {
+    if (!this._startedAt) return log('[PROGRESS] indexing session not active')
     const total = this._progressEnqueued - this._progressOffset
     let progress = -1
     if (total && !Number.isNaN(total)) {
       const nDone = this._progressProcessed - this._progressOffset
       progress = Math.round((nDone / total) * 10000) / 100
     }
+
     const sessionDuration = Math.round((new Date().getTime() - this._startedAt.getTime()) / (1000 * 60) * 100) / 100
     const uptime = Math.round((new Date().getTime() - this._initializedAt) / (1000 * 60) * 100) / 100
 
@@ -113,6 +115,7 @@ class Indexer {
   }
 
   _joinTopic (topic, handlers) {
+    if (OFFLINE) return Promise.resolve()
     this._swarmHandlers[topic.hexSlice()] = handlers
     return defer(unlock => {
       const idleTimer = setTimeout(unlock.bind(null, new Error('IDLE_TIMEOUT')), IDLE_TIMEOUT)
@@ -124,6 +127,7 @@ class Indexer {
   }
 
   _leaveTopic (topic) {
+    if (OFFLINE) return Promise.resolve()
     delete this._swarmHandlers[topic.hexSlice()]
     return defer(done => this.swarm.leave(topic, err => {
       log('Topic left', topic.hexSlice(), err)
@@ -276,8 +280,9 @@ class Indexer {
     let crawlError = null
     try {
       await swarmJoinedLock
-      log('topic joined, waiting for updates', topic.toString('hex'))
+
       // Not sure if mingling is necessary, trying to avoid empty drive.readdir()
+      log(`topic joined, waiting for updates ${MINGLE_TIMEOUT / 1000}s`, topic.toString('hex'))
       await defer(d => setTimeout(d, MINGLE_TIMEOUT))
 
       // Crawl content
@@ -521,7 +526,7 @@ async function readRemoteFile (drive, file, maxSize = 1024 * 1024 * 5, raw = fal
   pickledError.file = file
 
   // Fetch the stat first
-  const fstat = await defer(d => {
+  const stat = await defer(d => {
     const timer = setTimeout(() => {
       d(pickledError)
     }, DOWNLOAD_TIMEOUT)
@@ -530,25 +535,33 @@ async function readRemoteFile (drive, file, maxSize = 1024 * 1024 * 5, raw = fal
       d(err, stat)
     })
   })
-
   // Return stat if body is empty, oversize body is treated as empty file: "ignored".
-  if (!fstat.size || fstat.size > maxSize) return { fstat, body: null }
+  if (!stat.size || stat.size > maxSize) return { stat, body: null }
 
-  const body = await defer(d => {
-    log('downloading...', file)
-    const timer = setTimeout(() => d(new Error('DOWNLOAD_TIMEOUT')), DOWNLOAD_TIMEOUT)
-
-    drive.download(file, err => {
-      clearTimeout(timer)
-      log('download complete', file)
-      if (err) return d(err)
-      drive.readFile(file, (err, chunk) => {
-        if (err) return d(err)
-        d(null, raw ? chunk : chunk.toString('utf8'))
+  // check if file is available
+  const accessError = await defer(d =>
+    drive.access(file, { wait: false }, d.bind(null, null))
+  )
+  if (accessError) {
+    // Wait for file to download
+    await defer(d => {
+      log('downloading...', file)
+      const timer = setTimeout(() => d(new Error('DOWNLOAD_TIMEOUT')), DOWNLOAD_TIMEOUT)
+      drive.download(file, err => {
+        clearTimeout(timer)
+        log('download complete', file, err || '')
+        d(err)
       })
     })
+  }
+  // buffer file content into memory.
+  const body = await defer(d => {
+    drive.readFile(file, (err, chunk) => {
+      if (err) return d(err)
+      d(null, raw ? chunk : chunk.toString('utf8'))
+    })
   })
-  return { fstat, body }
+  return { stat, body }
 }
 
 async function scrape () {
