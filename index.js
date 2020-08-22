@@ -60,9 +60,14 @@ class Indexer {
   constructor () {
     this.queue = new NanoQueue(PARALLELIZATION, {
       process: this._process.bind(this),
-      oncomplete: () => log('Queue finished', this._dist.version)
+      oncomplete: this._queDone.bind(this)
     })
+
     this._drives = {}
+    this._progressOffset = 0
+    this._progressEnqueued = 0
+    this._progressProcessed = 0
+    this._initializedAt = new Date().getTime()
     this._dist = hyperdrive('./dist')
     this._dist.on('ready', async () => {
       console.log(`Database url: hyper://${this._dist.key.hexSlice()}`)
@@ -85,6 +90,26 @@ class Indexer {
     this._swarmHandlers = {}
     // § this._sockets = []
     this.swarm = swarm
+  }
+
+  logProgress () {
+    const total = this._progressEnqueued - this._progressOffset
+    let progress = -1
+    if (total && !Number.isNaN(total)) {
+      const nDone = this._progressProcessed - this._progressOffset
+      progress = Math.round((nDone / total) * 10000) / 100
+    }
+    const sessionDuration = Math.round((new Date().getTime() - this._startedAt.getTime()) / (1000 * 60) * 100) / 100
+    const uptime = Math.round((new Date().getTime() - this._initializedAt) / (1000 * 60) * 100) / 100
+
+    log(`[PROGRESS] ${progress}% (${this._progressProcessed}/${this._progressEnqueued}), db-version: ${this._dist.version}, session time: ${sessionDuration}min, uptime: ${uptime}min`)
+  }
+
+  _queDone () {
+    const minutes = (new Date().getTime() - this._startedAt.getTime()) / (1000 * 60)
+    this._startedAt = null
+    this.logProgress()
+    log('Queue finished', this._dist.version, `took ${minutes} minutes`)
   }
 
   _joinTopic (topic, handlers) {
@@ -170,6 +195,11 @@ class Indexer {
 
   index (url, force = false) {
     // TODO: if !force refuse to process drives that already were indexed during the last 6 hours
+    if (!this._startedAt) {
+      this._startedAt = new Date()
+      this._progressOffset = this._progressProcessed
+    }
+    this._progressEnqueued++
     this.queue.push(url)
   }
 
@@ -198,11 +228,18 @@ class Indexer {
 
   _process (url, done) {
     log('^ SLOT allocated', this._dist.version, url)
+    this.logProgress()
     this._processURL(url)
-      .then(() => log('$ SLOT freed success', this._dist.version, url))
+      .then(() => {
+        log('$ SLOT freed success', this._dist.version, url)
+        this._progressProcessed++
+        this.logProgress()
+      })
       .then(done.bind(null, null))
       .catch(err => {
         console.error('$ SLOT freed due to err', this._dist.version, err)
+        this._progressProcessed++
+        this.logProgress()
         done()
       })
   }
