@@ -15,7 +15,7 @@ const analyzeImage = require('./lib/analyzer_image.js')
  * This setting trips up OS-resource limits fast.
  * ( Set it to `1` during debugging to avoid hair-loss )
  */
-const PARALLELIZATION = 6
+const PARALLELIZATION = 9
 
 /*
  * Amount of files to be analyze in parallel for each drive.
@@ -35,7 +35,7 @@ const MINGLE_TIMEOUT = 1000 * 10
 /*
  * Wait msecs before giving up on downloading a file.
  */
-const DOWNLOAD_TIMEOUT = 1000 * 60
+const DOWNLOAD_TIMEOUT = 1000 * 120
 
 /*
  * How long to wait for peer discovery and connection
@@ -72,8 +72,78 @@ class Indexer {
         description: 'Contains pre-indexed records ready to be looked up'
       }))
     })
+
+    // Initialize swarm
+    const swarm = hyperswarm({
+      ephemeral: true,
+      maxPeers: 50,
+      // maxServerSockets: 0
+      multiplex: true
+    })
+    swarm.on('peer', this._onSwarmPeer.bind(this))
+    swarm.on('connection', this._onSwarmConnection.bind(this))
+    this._swarmHandlers = {}
+    // § this._sockets = []
+    this.swarm = swarm
   }
 
+  _joinTopic (topic, handlers) {
+    this._swarmHandlers[topic.hexSlice()] = handlers
+    return defer(unlock => {
+      const idleTimer = setTimeout(unlock.bind(null, new Error('IDLE_TIMEOUT')), IDLE_TIMEOUT)
+      this.swarm.join(topic, { lookup: true, announce: false }, () => {
+        clearTimeout(idleTimer)
+        unlock()
+      })
+    })
+  }
+
+  _leaveTopic (topic) {
+    delete this._swarmHandlers[topic.hexSlice()]
+    return defer(done => this.swarm.leave(topic, err => {
+      log('Topic left', topic.hexSlice(), err)
+      // § for (const socket of sockets) socket.end()
+      done(err)
+    }))
+  }
+
+  _onSwarmPeer (peer) {
+    const handlers = this._swarmHandlers[peer.topic.hexSlice()]
+    if (!handlers) throw new Error('NoHandlersFound')
+    if (typeof handlers.onpeer === 'function') handlers.onpeer(peer)
+  }
+
+  _onSwarmConnection (socket, info) {
+    // const { host, local, referrer, topic } = peer
+    if (info.peer.host === '35.209.63.38' || info.peer.host === '35.209.182.2') return // Ignore hyperdivision dht-crawlers
+    if (!info.client) {
+      log('BUG! We should be in client-mode')
+      process.exit(1)
+    }
+    log('Connection established', info.peer && info.peer.host)
+    // § sockets.push(socket)
+    eos(socket, err => {
+      log('Socket Closed', err && err.message === 'Readable stream closed before ending' ? 'read error' : err)
+      // § const idx = sockets.indexOf(socket)
+      // § if (~idx) sockets.splice(idx, 1)
+    })
+
+    const uniqueTopics = Object.values(info.topics.reduce((h, t) => {
+      h[t.hexSlice()] = t
+      return h
+    }, {}))
+
+    for (const topic of uniqueTopics) {
+      const handlers = this._swarmHandlers[topic.hexSlice()]
+      if (handlers && typeof handlers.onconnect === 'function') handlers.onconnect(socket, info.peer)
+    }
+  }
+
+  /* This method distributes the database
+   * by joining the database's topic,
+   * if you want to create a replication stream for the database
+   * use indexer._dist.replicate() for now.
+   */
   replicate () {
     const topic = discoveryKey(this._dist.key)
     const swarm = hyperswarm({
@@ -128,7 +198,7 @@ class Indexer {
 
   _process (url, done) {
     log('^ SLOT allocated', this._dist.version, url)
-    this._joinSwarm(url)
+    this._processURL(url)
       .then(() => log('$ SLOT freed success', this._dist.version, url))
       .then(done.bind(null, null))
       .catch(err => {
@@ -137,7 +207,7 @@ class Indexer {
       })
   }
 
-  async _joinSwarm (url) {
+  async _processURL (url) {
     const key = resolveKey(url)
     if (!key) throw new Error('KeyResolutionFailure')
     // TODO: index only if hasn't been indexed within 2hours, use the `about/{drive.key}` index for lookup.
@@ -147,43 +217,23 @@ class Indexer {
     if (this._drives[key.toString('hex')]) return log('already being processed')
     const drive = await this._getDrive(key)
     const topic = discoveryKey(key)
-    const swarm = hyperswarm({
-      multiplex: false,
-      ephemeral: true
-      // maxServerSockets: 0
-    })
-
-    const sockets = []
     const uniquePeers = {}
-    swarm.on('peer', peer => {
-      uniquePeers[peer.host] = true
-    })
-    swarm.on('connection', (socket, info) => {
-      // const { type, client, topics, peer } = info
-      // const { host, local, referrer, topic } = peer
-      log('Connection established', info.peer && info.peer.host)
-      sockets.push(socket)
-      eos(socket, err => {
-        log('Socket Closed', err && err.message === 'Readable stream closed before ending' ? 'read error' : err)
-        const idx = sockets.indexOf(socket)
-        if (~idx) sockets.splice(idx, 1)
-      })
-      const dstream = drive.replicate(info.client, { live: true, encrypt: true })
-      dstream.on('error', err => {
-        if (err.message === 'Resource is closed') log('!!! Replication failure', err.message)
-        else console.warn('!!! Replication failure', url.toString(), err)
-      })
-      dstream.on('close', log.bind(null, 'drive-replication stream closed'))
-      dstream.pipe(socket).pipe(dstream)
+    const swarmJoinedLock = this._joinTopic(topic, {
+      onpeer (peer) {
+        uniquePeers[peer.host] = true
+      },
+      onconnect (socket, peer) {
+        log('onconnect', peer.host)
+        const dstream = drive.replicate(true, { live: false, encrypt: true })
+        dstream.on('error', err => {
+          if (err.message === 'Resource is closed') log('!!! Replication failure', peer.host, err.message)
+          else console.warn('!!! Replication failure', url.toString(), peer.host, err)
+        })
+        dstream.on('close', log.bind(null, 'drive-replication stream closed'))
+        dstream.pipe(socket).pipe(dstream)
+      }
     })
 
-    const swarmJoinedLock = defer(unlock => {
-      const idleTimer = setTimeout(unlock.bind(null, new Error('IDLE_TIMEOUT')), IDLE_TIMEOUT)
-      swarm.join(topic, { lookup: true, announce: false }, () => {
-        clearTimeout(idleTimer)
-        unlock()
-      })
-    })
     log('Swarm Initialized, waiting for peers', url)
     // Clean up resources on failure.
     let crawlError = null
@@ -211,12 +261,8 @@ class Indexer {
       crawlError = err
     } finally {
       // Free resources
-      await defer(done => swarm.leave(topic, err => {
-        log('Topic left', topic.hexSlice(), err)
-        done(err)
-      }))
+      await this._leaveTopic(topic)
       await this._releaseDrive(drive)
-      for (const socket of sockets) socket.end()
     }
     log('Drive resources released', url.toString())
     if (crawlError) throw crawlError
